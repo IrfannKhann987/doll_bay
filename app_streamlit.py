@@ -1,39 +1,15 @@
-import os
 import json
-import requests
 import streamlit as st
 
 from schemas import HabitState, QuizForm, QuizSummary, Plan21D
-
-# --------------------- API Client --------------------- #
-
-API_BASE = os.getenv("UNHABIT_API_BASE", "http://localhost:8000")
-
-
-def call_api(path: str, payload: dict) -> dict:
-    """
-    Helper to call the Unhabit FastAPI.
-
-    - path: e.g. "/onboarding/start"
-    - payload: dict that will be sent as JSON
-
-    Raises RuntimeError with details if the API responds with 4xx/5xx.
-    """
-    url = f"{API_BASE}{path}"
-    try:
-        resp = requests.post(url, json=payload, timeout=60)
-    except Exception as e:
-        raise RuntimeError(f"API {path} request failed: {e}")
-
-    if resp.status_code >= 400:
-        try:
-            data = resp.json()
-        except Exception:
-            data = resp.text
-        raise RuntimeError(f"API {path} failed: {resp.status_code} – {data}")
-
-    return resp.json()
-
+from ai_nodes import (
+    safety_node,
+    quiz_form_node,
+    quiz_summary_node,
+    plan21_node,
+    coach_node,
+    why_day_node,  # ✅ WHY engine
+)
 
 # --------------------- Streamlit setup --------------------- #
 
@@ -62,8 +38,7 @@ init_state()
 
 def update_state(partial: dict):
     """
-    Apply partial updates to the HabitState object in session.
-    (We still use this for local fields like last_why_day, etc.)
+    Apply node outputs (dict) to the HabitState object in session.
     """
     state: HabitState = st.session_state.habit_state
     for key, value in partial.items():
@@ -126,33 +101,24 @@ with col_left:
             # Update habit description in state
             state.habit_description = habit_text.strip()
 
-            try:
-                # 🔥 Call API: safety + quiz_form
-                data = call_api(
-                    "/onboarding/start",
-                    {
-                        "habit_description": state.habit_description,
-                        "user_id": state.user_id,
-                    },
+            # 1) Safety check
+            safety_result = safety_node(state)
+            update_state(safety_result)
+            state = st.session_state.habit_state
+
+            # Hard-stop if safety blocks
+            if state.safety and state.safety.action == "block_and_escalate":
+                st.error(
+                    "❌ I’m here only for habit and behavior coaching, so I can’t help with medical, "
+                    "illegal, explicit, or harmful requests. If this is about your health, safety, or a "
+                    "serious situation, please reach out to a trusted person or a local professional."
                 )
+                st.stop()  # do NOT generate quiz or anything else for this input
 
-                # API returns a full HabitState
-                st.session_state.habit_state = HabitState(**data)
-                state = st.session_state.habit_state
-
-                # Hard-stop if safety blocks
-                if state.safety and state.safety.action == "block_and_escalate":
-                    st.error(
-                        "❌ I’m here only for habit and behavior coaching, so I can’t help with medical, "
-                        "illegal, explicit, or harmful requests. If this is about your health, safety, or a "
-                        "serious situation, please reach out to a trusted person or a local professional."
-                    )
-                    st.stop()
-
-                st.success("✅ Quiz generated. Scroll to step 2 to answer the questions.")
-
-            except RuntimeError as e:
-                st.error(f"Failed to generate quiz via API: {e}")
+            # 2) Generate quiz form (only for safe, in-scope content)
+            quiz_result = quiz_form_node(state)
+            update_state(quiz_result)
+            st.success("✅ Quiz generated. Scroll to step 2 to answer the questions.")
 
     # Show safety status if available
     if state.safety:
@@ -207,6 +173,7 @@ with col_mid:
             if selected_option_id and selected_option_id in option_ids:
                 preselected_index = option_ids.index(selected_option_id)
             elif isinstance(state.user_quiz_answers, dict):
+                # If answers already in state (e.g. after rerun)
                 existing = state.user_quiz_answers.get(q.id)
                 if existing and existing in option_ids:
                     preselected_index = option_ids.index(existing)
@@ -230,57 +197,37 @@ with col_mid:
             # Structured dict: {question_id: option_id}
             answers_dict = dict(st.session_state.quiz_answers_cache)
 
-            # Store directly as dict in HabitState (matches schema)
+            # Store directly as dict in HabitState (matches new schema)
+            st.session_state.habit_state.user_quiz_answers = answers_dict
+
+            # 1) Summarize quiz
+            summary_result = quiz_summary_node(st.session_state.habit_state)
+            update_state(summary_result)
+
+            # 2) Generate plan
+            plan_result = plan21_node(st.session_state.habit_state)
+            update_state(plan_result)
+
+            # 3) Reset WHY-info for new plan
+            update_state({
+                "last_why_day": None,
+                "last_why_explanation": None,
+            })
+
+            # 4) Generate first coach reply
+            st.session_state.habit_state.last_user_message = None
+            coach_result = coach_node(st.session_state.habit_state)
+            update_state(coach_result)
+
+
             state = st.session_state.habit_state
-            state.user_quiz_answers = answers_dict
-
-            try:
-                # 1) Summarize quiz via API
-                summary_json = call_api(
-                    "/quiz-summary",
-                    {
-                        "state": state.model_dump(),
-                    },
+            if state.safety and state.safety.action == "allow":
+                st.success(
+                    f"Plan generated and safety still OK ✅  \n"
+                    f"Risk classification: {state.safety.risk}"
                 )
-                state.quiz_summary = QuizSummary(**summary_json)
-
-                # 2) Generate plan via API
-                plan_json = call_api(
-                    "/plan-21d",
-                    {
-                        "state": state.model_dump(),
-                    },
-                )
-                state.plan21 = Plan21D(**plan_json)
-
-                # 3) Reset WHY-info for new plan (local)
-                state.last_why_day = None
-                state.last_why_explanation = None
-
-                # 4) Generate first coach reply via API
-                state.last_user_message = None
-                coach_json = call_api(
-                    "/coach",
-                    {
-                        "state": state.model_dump(),
-                    },
-                )
-                state.coach_reply = coach_json.get("coach_reply", "")
-                state.chat_history = coach_json.get("chat_history", [])
-
-                st.session_state.habit_state = state
-
-                state = st.session_state.habit_state
-                if state.safety and state.safety.action == "allow":
-                    st.success(
-                        f"Plan generated and safety still OK ✅  \n"
-                        f"Risk classification: {state.safety.risk}"
-                    )
-                else:
-                    st.warning("Plan generated, but safety indicates this may need review.")
-
-            except RuntimeError as e:
-                st.error(f"Failed to generate plan via API: {e}")
+            else:
+                st.warning("Plan generated, but safety indicates this may need review.")
 
 
 # ----------------------------------------------------
@@ -301,7 +248,7 @@ with col_right:
 
         st.markdown("#### 📅 Daily tasks")
 
-        # Iterate days in order
+        # Re-read state each loop in case WHY updates it
         for day_key in sorted(plan.day_tasks.keys(), key=lambda x: int(x.split("_")[1])):
             state = st.session_state.habit_state
             task_text = state.plan21.day_tasks[day_key]
@@ -315,27 +262,21 @@ with col_right:
                 with cols[1]:
                     if st.button("Why?", key=f"why_btn_{day_key}"):
                         try:
-                            day_num = int(day_key.split("_")[1])
-                            why_json = call_api(
-                                "/why-day",
-                                {
-                                    "state": state.model_dump(),
-                                    "day_number": day_num,
-                                },
-                            )
-                            explanation = why_json.get("explanation", "")
+                            # why_day_node returns a dict: {"last_why_day": ..., "last_why_explanation": ...}
+                            why_result = why_day_node(state, day_key)
 
-                            # Save locally in state for display
-                            state.last_why_day = day_key
-                            state.last_why_explanation = explanation
-                            st.session_state.habit_state = state
+                            # If for some reason it returns a string (old version), wrap it
+                            if isinstance(why_result, str):
+                                why_result = {
+                                    "last_why_day": day_key,
+                                    "last_why_explanation": why_result,
+                                }
 
+                            update_state(why_result)
                             st.rerun()  # refresh so caption shows under correct day
 
-                        except RuntimeError as e:
-                            st.error(f"Why this task? API failed: {e}")
                         except Exception as e:
-                            st.error(f"Why this task? Unexpected error: {e}")
+                            st.error(f"Why this task? Why-engine failed: {e}")
 
                 # After the button, show explanation if this is the last-asked day
                 state = st.session_state.habit_state
@@ -373,33 +314,22 @@ with col_right:
             if not user_msg.strip():
                 st.warning("Please type a message for the coach.")
             else:
-                state = st.session_state.habit_state
                 state.last_user_message = user_msg.strip()
+                coach_result = coach_node(state)
+                update_state(coach_result)
 
-                try:
-                    coach_json = call_api(
-                        "/coach",
-                        {
-                            "state": state.model_dump(),
-                        },
+                state = st.session_state.habit_state
+                if state.safety and state.safety.action == "allow":
+                    st.success(
+                        f"Safety status: OK ✅  \n"
+                        f"Risk classification: {state.safety.risk}"
+                    )
+                else:
+                    st.warning(
+                        "Coach replied, but latest safety check suggests this may be sensitive content."
                     )
 
-                    state.coach_reply = coach_json.get("coach_reply", "")
-                    state.chat_history = coach_json.get("chat_history", [])
-                    st.session_state.habit_state = state
+                st.rerun()  # refresh to show updated chat
 
-                    state = st.session_state.habit_state
-                    if state.safety and state.safety.action == "allow":
-                        st.success(
-                            f"Safety status: OK ✅  \n"
-                            f"Risk classification: {state.safety.risk}"
-                        )
-                    else:
-                        st.warning(
-                            "Coach replied, but latest safety check suggests this may be sensitive content."
-                        )
 
-                    st.rerun()  # refresh to show updated chat
 
-                except RuntimeError as e:
-                    st.error(f"Coach API call failed: {e}")
